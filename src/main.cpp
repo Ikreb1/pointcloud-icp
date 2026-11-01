@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <Eigen/Dense>
+#include <omp.h>
 
 constexpr int TEST_SIZE = 10000;
 
@@ -81,7 +82,9 @@ struct NearestResult
 
 // Brute force: checks every point in `target`. Compares squared distances,
 // since sqrt preserves order and is expensive.
-NearestResult nearestNeighbour(const Cloud& target, const Point& query)
+// noinline: keeps brute force as its own entry in perf report instead of being
+// folded into runIcp. One call per 10k distance checks, so the cost is negligible.
+[[gnu::noinline]] NearestResult nearestNeighbour(const Cloud& target, const Point& query)
 {
 	NearestResult best;
 	for (int i = 0; i < static_cast<int>(target.points.size()); ++i)
@@ -327,7 +330,11 @@ IcpResult runIcp(const Cloud& source, const Cloud& target, Search search, int ma
 
 		// Match: nearest target point for every source point.
 		// Brute force is O(N*M), the tree roughly O(N log M).
+		// Each query only reads the tree/target and writes its own matches[i], so
+		// threads never share data except sumSquared, which `reduction` gives each
+		// thread a private copy of and adds up at the end.
 		double sumSquared = 0;
+#pragma omp parallel for reduction(+ : sumSquared) schedule(static)
 		for (int i = 0; i < static_cast<int>(current.points.size()); ++i)
 		{
 			const NearestResult nearest = tree ? tree->nearest(current.points[i]) : nearestNeighbour(target, current.points[i]);
@@ -440,7 +447,7 @@ int main()
 	std::cout << "k-d tree vs brute force, 10000 random queries: "
 	          << (kdTreeMatchesBruteForce(a, 10000, rng) ? "identical" : "DIFFERENT") << "\n\n";
 
-	std::cout << TEST_SIZE << " points, leaf size " << KD_LEAF_SIZE << "\n";
+	std::cout << TEST_SIZE << " points, leaf size " << KD_LEAF_SIZE << ", " << omp_get_max_threads() << " threads\n";
 	runScenario("brute  10 deg, clean", a, Search::BruteForce, 10, 0.0f, rng);
 	runScenario("kdtree 10 deg, clean", a, Search::KdTree, 10, 0.0f, rng);
 	runScenario("kdtree 10 deg, noise", a, Search::KdTree, 10, 0.005f, rng);
