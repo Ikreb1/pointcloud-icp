@@ -182,7 +182,7 @@ public:
 	NearestResult nearest(const Point& query) const
 	{
 		NearestResult best;
-		search<true>(0, query, best);
+		search<true>(query, best);
 		return best;
 	}
 
@@ -190,7 +190,7 @@ public:
 	NearestResult nearestScalar(const Point& query) const
 	{
 		NearestResult best;
-		search<false>(0, query, best);
+		search<false>(query, best);
 		return best;
 	}
 
@@ -299,36 +299,57 @@ private:
 	}
 #endif
 
+	// Iterative search with an explicit stack instead of recursion: no function
+	// call per node visited. Walk down to the leaf the query is in, pushing each
+	// far side we pass along with its distance to the split plane. After a leaf,
+	// pop far sides until one could still hold something closer than `best`.
 	template <bool UseSimd>
-	void search(int nodeIndex, const Point& query, NearestResult& best) const
+	void search(const Point& query, NearestResult& best) const
 	{
-		const Node& node = m_nodes[nodeIndex];
+		// The query as an array, so the split axis is an index instead of a
+		// chain of branches (coord()).
+		const float q[3] = {query.x, query.y, query.z};
 
-		if (node.axis < 0)
+		// Depth is about log2(points / leaf size): 64 covers far more points than fit in memory.
+		constexpr int MAX_DEPTH = 64;
+		int stackNode[MAX_DEPTH];
+		float stackPlaneDistSq[MAX_DEPTH];
+		int top = 0;
+
+		int nodeIndex = 0;
+		while (true)
 		{
+			// Down to a leaf, always taking the side the query is on.
+			const Node* node = &m_nodes[nodeIndex];
+			while (node->axis >= 0)
+			{
+				const float diff = q[node->axis] - node->split;
+				const int nearChild = diff < 0 ? node->a : node->b;
+				const int farChild = diff < 0 ? node->b : node->a;
+				stackNode[top] = farChild;
+				stackPlaneDistSq[top] = diff * diff;
+				++top;
+				node = &m_nodes[nearChild];
+			}
+
 #ifdef __AVX2__
 			if constexpr (UseSimd)
-			{
-				scanLeafSimd(node, query, best);
-				return;
-			}
+				scanLeafSimd(*node, query, best);
+			else
 #endif
-			scanLeafScalar(node, query, best);
-			return;
+				scanLeafScalar(*node, query, best);
+
+			// Backtrack: everything on a far side is at least planeDist away. `best`
+			// has usually shrunk since it was pushed, so most far sides are skipped
+			// here without ever being visited.
+			do
+			{
+				if (top == 0)
+					return;
+				--top;
+			} while (stackPlaneDistSq[top] >= best.distanceSquared);
+			nodeIndex = stackNode[top];
 		}
-
-		// Descend into the side the query is on first: it most likely holds
-		// the nearest point, which shrinks `best` and lets us prune more.
-		const float diff = coord(query, node.axis) - node.split;
-		const int nearChild = diff < 0 ? node.a : node.b;
-		const int farChild = diff < 0 ? node.b : node.a;
-
-		search<UseSimd>(nearChild, query, best);
-
-		// Backtrack: everything on the far side is at least |diff| away along
-		// this axis. Only search it if that could beat the best so far.
-		if (diff * diff < best.distanceSquared)
-			search<UseSimd>(farChild, query, best);
 	}
 
 	int m_leafSize;
