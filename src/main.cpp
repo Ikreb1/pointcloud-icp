@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -17,7 +18,7 @@ constexpr int TEST_SIZE = 10000;
 
 // Max points per k-d tree leaf. Tweak and benchmark: smaller = deeper tree and
 // more node visits, larger = longer brute-force scans in each leaf.
-constexpr int KD_LEAF_SIZE = 16;
+constexpr int KD_LEAF_SIZE = 32;
 static_assert(KD_LEAF_SIZE % 8 == 0, "leaves must be whole 8-wide SIMD registers");
 
 struct Point
@@ -601,6 +602,41 @@ bool kdTreeMatchesBruteForce(const Cloud& cloud, Search search, int queries, std
 	return true;
 }
 
+// Times the nearest-neighbour queries alone (98% of an ICP iteration) for
+// different leaf sizes. Queries: the target rotated 10 degrees plus noise,
+// like an early ICP iteration. Best of 5 runs, to filter out noise.
+void benchmarkLeafSizes(const Cloud& target, std::mt19937& rng)
+{
+	const Cloud queries = addNoise(transformCloud(target, rotationZ(10.0f * std::numbers::pi_v<float> / 180.0f), {0.1f, -0.05f, 0.2f}), 0.005f, rng);
+	const int n = static_cast<int>(queries.points.size());
+
+	std::cout << "\nLeaf size sweep, " << target.points.size() << " points (ms for all queries, best of 5):\n";
+	std::cout << "  leaf   build ms   scalar ms   simd ms   simd speedup\n";
+	for (int leafSize : {8, 16, 32, 64, 128})
+	{
+		const auto buildStart = std::chrono::steady_clock::now();
+		const KdTree tree(target, leafSize);
+		const double buildMs = msSince(buildStart);
+
+		double best[2] = {1e30, 1e30};
+		for (int simd = 0; simd < 2; ++simd)
+		{
+			for (int run = 0; run < 5; ++run)
+			{
+				const auto start = std::chrono::steady_clock::now();
+				double checksum = 0; // use the results so the compiler can't skip the work
+#pragma omp parallel for reduction(+ : checksum) schedule(static)
+				for (int i = 0; i < n; ++i)
+					checksum += simd ? tree.nearest(queries.points[i]).distanceSquared : tree.nearestScalar(queries.points[i]).distanceSquared;
+				best[simd] = std::min(best[simd], msSince(start));
+				if (checksum < 0)
+					std::cout << "";
+			}
+		}
+		std::printf("  %4d   %8.2f   %9.3f   %7.3f   %.2fx\n", leafSize, buildMs, best[0], best[1], best[0] / best[1]);
+	}
+}
+
 int main()
 {
 	std::mt19937 rng(42);
@@ -625,5 +661,6 @@ int main()
 		std::cout << "\nSpeed, " << size << " points, 10 deg + noise:\n";
 		runScenario("scalar", big, Search::KdTreeScalar, 10, 0.005f, rng);
 		runScenario("simd  ", big, Search::KdTreeSimd, 10, 0.005f, rng);
+		benchmarkLeafSizes(big, rng);
 	}
 }
