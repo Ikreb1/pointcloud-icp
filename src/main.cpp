@@ -74,6 +74,19 @@ Cloud transformCloud(const Cloud& in, const Eigen::Matrix3f& R, const Eigen::Vec
 	return out;
 }
 
+// Applies p' = R * p + t to every point of `cloud`, in place and in parallel.
+// Used inside ICP: no new allocation each iteration, and each point is independent.
+void transformInPlace(Cloud& cloud, const Eigen::Matrix3f& R, const Eigen::Vector3f& t)
+{
+#pragma omp parallel for schedule(static)
+	for (int i = 0; i < static_cast<int>(cloud.points.size()); ++i)
+	{
+		Point& p = cloud.points[i];
+		const Eigen::Vector3f q = R * Eigen::Vector3f(p.x, p.y, p.z) + t;
+		p = {q.x(), q.y(), q.z()};
+	}
+}
+
 struct NearestResult
 {
 	int index = -1;
@@ -245,36 +258,55 @@ struct RigidTransform
 	Eigen::Vector3f t = Eigen::Vector3f::Zero();
 };
 
-// Best-fit R and t that move source.points[i] onto target.points[matches[i]]
-// (least squares, Kabsch/SVD method). Sums are done in double: adding
-// thousands of floats into one running total loses precision.
-RigidTransform estimateRigidTransform(const Cloud& source, const Cloud& target, const std::vector<int>& matches)
+// Running totals over matched pairs (source point, target point). Everything
+// the alignment needs fits in these 15 numbers plus a count, so they can be
+// accumulated during matching, one copy per thread, and added together after.
+// Sums are in double: adding thousands of floats into one running total loses precision.
+struct PairSums
 {
-	const int n = static_cast<int>(source.points.size());
+	Eigen::Vector3d sourceSum = Eigen::Vector3d::Zero(); // sum of source points
+	Eigen::Vector3d targetSum = Eigen::Vector3d::Zero(); // sum of matched target points
+	Eigen::Matrix3d outerSum = Eigen::Matrix3d::Zero();  // sum of (source point) * (target point)^T
+	long count = 0;
 
-	// 1. Centroids.
-	Eigen::Vector3d sourceCentroid = Eigen::Vector3d::Zero();
-	Eigen::Vector3d targetCentroid = Eigen::Vector3d::Zero();
-	for (int i = 0; i < n; ++i)
+	void add(const Point& source, const Point& target)
 	{
-		const Point& s = source.points[i];
-		const Point& d = target.points[matches[i]];
-		sourceCentroid += Eigen::Vector3d(s.x, s.y, s.z);
-		targetCentroid += Eigen::Vector3d(d.x, d.y, d.z);
+		const Eigen::Vector3d s(source.x, source.y, source.z);
+		const Eigen::Vector3d d(target.x, target.y, target.z);
+		sourceSum += s;
+		targetSum += d;
+		outerSum += s * d.transpose();
+		++count;
 	}
-	sourceCentroid /= n;
-	targetCentroid /= n;
 
-	// 2 + 3. Cross-covariance of the centred pairs: H = sum of s * d^T.
-	Eigen::Matrix3d H = Eigen::Matrix3d::Zero();
-	for (int i = 0; i < n; ++i)
+	PairSums& operator+=(const PairSums& other)
 	{
-		const Point& s = source.points[i];
-		const Point& d = target.points[matches[i]];
-		const Eigen::Vector3d sc = Eigen::Vector3d(s.x, s.y, s.z) - sourceCentroid;
-		const Eigen::Vector3d dc = Eigen::Vector3d(d.x, d.y, d.z) - targetCentroid;
-		H += sc * dc.transpose();
+		sourceSum += other.sourceSum;
+		targetSum += other.targetSum;
+		outerSum += other.outerSum;
+		count += other.count;
+		return *this;
 	}
+};
+
+// Lets PairSums be used in `reduction(+ : ...)`: each thread gets its own
+// default-constructed (zero) copy, and OpenMP adds them together at the end.
+#pragma omp declare reduction(+ : PairSums : omp_out += omp_in)
+
+// Best-fit R and t from accumulated pair sums (least squares, Kabsch/SVD method).
+RigidTransform rigidTransformFromSums(const PairSums& sums)
+{
+	// 1. Centroids: the average source point and the average target point.
+	const Eigen::Vector3d sourceCentroid = sums.sourceSum / sums.count;
+	const Eigen::Vector3d targetCentroid = sums.targetSum / sums.count;
+
+	// 2 + 3. Cross-covariance of the centred pairs, H = sum of (s - sourceCentroid)(d - targetCentroid)^T.
+	// Multiplying that out gives the same H from the raw sums, in one pass:
+	//   H = outerSum - count * sourceCentroid * targetCentroid^T
+	// Caveat: this subtracts two large, nearly equal matrices when the clouds sit
+	// far from the origin, which loses digits (catastrophic cancellation).
+	// Fine here: data is near the origin and the sums are double.
+	const Eigen::Matrix3d H = sums.outerSum - static_cast<double>(sums.count) * sourceCentroid * targetCentroid.transpose();
 
 	// 4. H = U * S * V^T. The closest rotation is R = V * U^T.
 	const Eigen::JacobiSVD<Eigen::Matrix3d, Eigen::ComputeFullU | Eigen::ComputeFullV> svd(H);
@@ -296,6 +328,15 @@ RigidTransform estimateRigidTransform(const Cloud& source, const Cloud& target, 
 	return {R.cast<float>(), t.cast<float>()};
 }
 
+// Best-fit R and t that move source.points[i] onto target.points[matches[i]].
+RigidTransform estimateRigidTransform(const Cloud& source, const Cloud& target, const std::vector<int>& matches)
+{
+	PairSums sums;
+	for (int i = 0; i < static_cast<int>(source.points.size()); ++i)
+		sums.add(source.points[i], target.points[matches[i]]);
+	return rigidTransformFromSums(sums);
+}
+
 struct IcpResult
 {
 	RigidTransform transform; // accumulated over all iterations: source -> target
@@ -305,9 +346,9 @@ struct IcpResult
 	double buildMs = 0;      // k-d tree build, once per run
 
 	// Per-iteration averages of each phase, in ms.
-	double matchMs = 0;      // nearest neighbour for every point (parallel)
-	double alignMs = 0;      // centroids, H, SVD (serial)
-	double transformMs = 0;  // apply R, t to the moving cloud (serial)
+	double matchMs = 0;      // nearest neighbour + pair sums for every point (parallel)
+	double alignMs = 0;      // centroids, H and SVD from the pair sums (serial, tiny)
+	double transformMs = 0;  // apply R, t to the moving cloud (parallel)
 };
 
 double msSince(std::chrono::steady_clock::time_point start)
@@ -331,7 +372,6 @@ IcpResult runIcp(const Cloud& source, const Cloud& target, Search search, int ma
 
 	double totalMs = 0, matchMs = 0, alignMs = 0, transformMs = 0;
 	Cloud current = source;
-	std::vector<int> matches(source.points.size());
 	float previousRmse = std::numeric_limits<float>::max();
 
 	for (int iter = 0; iter < maxIterations; ++iter)
@@ -339,30 +379,32 @@ IcpResult runIcp(const Cloud& source, const Cloud& target, Search search, int ma
 		const auto start = std::chrono::steady_clock::now();
 		auto phase = start;
 
-		// Match: nearest target point for every source point.
+		// Match: nearest target point for every source point, and add each pair
+		// straight into the alignment sums (no separate pass over the pairs).
 		// Brute force is O(N*M), the tree roughly O(N log M).
-		// Each query only reads the tree/target and writes its own matches[i], so
-		// threads never share data except sumSquared, which `reduction` gives each
-		// thread a private copy of and adds up at the end.
+		// Threads only read the tree/target. The two totals are `reduction`s: each
+		// thread fills its own private copy, OpenMP adds them up at the end.
 		double sumSquared = 0;
-#pragma omp parallel for reduction(+ : sumSquared) schedule(static)
+		PairSums sums;
+#pragma omp parallel for reduction(+ : sumSquared, sums) schedule(static)
 		for (int i = 0; i < static_cast<int>(current.points.size()); ++i)
 		{
-			const NearestResult nearest = tree ? tree->nearest(current.points[i]) : nearestNeighbour(target, current.points[i]);
-			matches[i] = nearest.index;
+			const Point& query = current.points[i];
+			const NearestResult nearest = tree ? tree->nearest(query) : nearestNeighbour(target, query);
 			sumSquared += nearest.distanceSquared;
+			sums.add(query, target.points[nearest.index]);
 		}
 		const float rmse = static_cast<float>(std::sqrt(sumSquared / current.points.size()));
 		matchMs += msSince(phase);
 
 		// Align.
 		phase = std::chrono::steady_clock::now();
-		const RigidTransform step = estimateRigidTransform(current, target, matches);
+		const RigidTransform step = rigidTransformFromSums(sums);
 		alignMs += msSince(phase);
 
 		// Apply.
 		phase = std::chrono::steady_clock::now();
-		current = transformCloud(current, step.R, step.t);
+		transformInPlace(current, step.R, step.t);
 		transformMs += msSince(phase);
 
 		// Compose: total = step after total, i.e. p -> R_s (R p + t) + t_s.
