@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -150,41 +151,122 @@ RigidTransform estimateRigidTransform(const Cloud& source, const Cloud& target, 
 	return {R.cast<float>(), t.cast<float>()};
 }
 
-void printPoint(const char* label, const Point& p)
+struct IcpResult
 {
-	std::cout << label << " (" << p.x << ", " << p.y << ", " << p.z << ")\n";
+	RigidTransform transform; // accumulated over all iterations: source -> target
+	int iterations = 0;
+	float rmse = 0;          // root mean square distance between matched pairs
+	double msPerIteration = 0;
+};
+
+// Point-to-point ICP: repeatedly match each source point to its nearest target
+// point, solve for the best rigid transform, and apply it. Stops when the error
+// improves by less than `tolerance` or after `maxIterations`.
+IcpResult runIcp(const Cloud& source, const Cloud& target, int maxIterations, float tolerance, bool verbose)
+{
+	IcpResult result;
+	double totalMs = 0;
+	Cloud current = source;
+	std::vector<int> matches(source.points.size());
+	float previousRmse = std::numeric_limits<float>::max();
+
+	for (int iter = 0; iter < maxIterations; ++iter)
+	{
+		const auto start = std::chrono::steady_clock::now();
+
+		// Match: nearest target point for every source point (the O(N*M) part).
+		double sumSquared = 0;
+		for (int i = 0; i < static_cast<int>(current.points.size()); ++i)
+		{
+			const NearestResult nearest = nearestNeighbour(target, current.points[i]);
+			matches[i] = nearest.index;
+			sumSquared += nearest.distanceSquared;
+		}
+		const float rmse = static_cast<float>(std::sqrt(sumSquared / current.points.size()));
+
+		// Align and apply.
+		const RigidTransform step = estimateRigidTransform(current, target, matches);
+		current = transformCloud(current, step.R, step.t);
+
+		// Compose: total = step after total, i.e. p -> R_s (R p + t) + t_s.
+		result.transform.R = step.R * result.transform.R;
+		result.transform.t = step.R * result.transform.t + step.t;
+
+		const auto end = std::chrono::steady_clock::now();
+		const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+		totalMs += ms;
+		if (verbose)
+			std::cout << "iter " << iter << "  rmse " << rmse << "  " << ms << " ms\n";
+
+		result.iterations = iter + 1;
+		result.rmse = rmse;
+		if (previousRmse - rmse < tolerance)
+			break;
+		previousRmse = rmse;
+	}
+	result.msPerIteration = totalMs / result.iterations;
+	return result;
+}
+
+// Returns a copy of `in` with Gaussian noise (standard deviation `sigma`) added to every coordinate.
+Cloud addNoise(const Cloud& in, float sigma, std::mt19937& rng)
+{
+	std::normal_distribution<float> noise(0.0f, sigma);
+	Cloud out = in;
+	for (Point& p : out.points)
+	{
+		p.x += noise(rng);
+		p.y += noise(rng);
+		p.z += noise(rng);
+	}
+	return out;
+}
+
+// Angle in degrees of the rotation that takes `estimated` to `truth`. 0 = identical.
+// Uses atan2(sin, cos) instead of acos(cos): float matrices are never exactly
+// orthonormal, and acos near 1 turns that ~1e-7 rounding into ~0.03 degrees of
+// fake error. The sin part comes from the antisymmetric half of the matrix,
+// which only changes when the rotation really differs.
+double rotationErrorDegrees(const Eigen::Matrix3f& estimated, const Eigen::Matrix3f& truth)
+{
+	const Eigen::Matrix3d D = estimated.cast<double>().transpose() * truth.cast<double>();
+	const double sinAngle = 0.5 * Eigen::Vector3d(D(2, 1) - D(1, 2), D(0, 2) - D(2, 0), D(1, 0) - D(0, 1)).norm();
+	const double cosAngle = (D.trace() - 1.0) / 2.0;
+	return std::atan2(sinAngle, cosAngle) * 180.0 / std::numbers::pi;
+}
+
+void runScenario(const char* name, const Cloud& source, float angleDegrees, float noiseSigma, std::mt19937& rng)
+{
+	const float angle = angleDegrees * std::numbers::pi_v<float> / 180.0f;
+	const Eigen::Matrix3f R = rotationZ(angle);
+	const Eigen::Vector3f t(0.1f, -0.05f, 0.2f);
+
+	Cloud target = transformCloud(source, R, t);
+	if (noiseSigma > 0)
+		target = addNoise(target, noiseSigma, rng);
+
+	const IcpResult icp = runIcp(source, target, 100, 1e-6f, false);
+	const double rotErr = rotationErrorDegrees(icp.transform.R, R);
+	const float transErr = (icp.transform.t - t).norm();
+
+	std::cout << name
+	          << "  iters " << icp.iterations
+	          << "  rmse " << icp.rmse
+	          << "  rot err " << rotErr << " deg"
+	          << "  trans err " << transErr
+	          << "  " << icp.msPerIteration << " ms/iter"
+	          << (rotErr < 0.5 ? "  OK" : "  FAILED") << "\n";
 }
 
 int main()
 {
 	std::mt19937 rng(42);
-	Cloud a = makeRandomCloud(TEST_SIZE, rng);
+	const Cloud a = makeRandomCloud(TEST_SIZE, rng);
 
-	const float angle = 10.0f * std::numbers::pi_v<float> / 180.0f;
-	const Eigen::Matrix3f R = rotationZ(angle);
-	const Eigen::Vector3f t(0.1f, -0.05f, 0.2f);
-
-	Cloud b = transformCloud(a, R, t);
-
-	std::cout << "R =\n" << R << "\n";
-	std::cout << "det(R) = " << R.determinant() << "\n";
-	std::cout << "R^T R is identity: " << std::boolalpha << (R.transpose() * R).isIdentity(1e-6f) << "\n";
-	printPoint("a[0] =", a.points[0]);
-	printPoint("b[0] =", b.points[0]);
-
-	const NearestResult self = nearestNeighbour(a, a.points[5]);
-	std::cout << "nearest to a[5] in a: index " << self.index << ", d2 " << self.distanceSquared << "\n";
-
-	const NearestResult moved = nearestNeighbour(a, b.points[5]);
-	std::cout << "nearest to b[5] in a: index " << moved.index << ", d2 " << moved.distanceSquared << "\n";
-
-	// With perfect matches (a[i] became b[i]) the alignment must recover R and t exactly.
-	std::vector<int> perfectMatches(a.points.size());
-	for (int i = 0; i < static_cast<int>(perfectMatches.size()); ++i)
-		perfectMatches[i] = i;
-
-	const RigidTransform recovered = estimateRigidTransform(a, b, perfectMatches);
-	std::cout << "recovered R =\n" << recovered.R << "\n";
-	std::cout << "recovered t = " << recovered.t.transpose() << "\n";
-	std::cout << "R error = " << (recovered.R - R).norm() << ", t error = " << (recovered.t - t).norm() << "\n";
+	std::cout << TEST_SIZE << " points, brute-force nearest neighbour\n\n";
+	runScenario("10 deg, clean    ", a, 10, 0.0f, rng);
+	runScenario("10 deg, noise    ", a, 10, 0.005f, rng);
+	runScenario("30 deg, clean    ", a, 30, 0.0f, rng);
+	runScenario("45 deg, clean    ", a, 45, 0.0f, rng);
+	runScenario("90 deg, clean    ", a, 90, 0.0f, rng);
 }
