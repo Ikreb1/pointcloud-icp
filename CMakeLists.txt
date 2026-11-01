@@ -5,6 +5,9 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
 endif()
 
+find_package(Eigen3 3.4...5 REQUIRED NO_MODULE)
+
 add_executable(icp src/main.cpp)
+target_link_libraries(icp PRIVATE Eigen3::Eigen)
 target_compile_features(icp PRIVATE cxx_std_20)
 target_compile_options(icp PRIVATE -Wall -Wextra -Wpedantic -march=native)
