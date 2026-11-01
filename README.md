@@ -26,7 +26,3 @@ Targets: x86 desktop (RTX 3070) and ARM (Raspberry Pi or similar) for the CPU st
 ## Data
 
 Public point cloud datasets (e.g. Stanford bunny, TUM RGB-D, KITTI subsets), plus synthetic clouds with known transforms for testing.
-
-## Status
-
-Stage 0: README only.
