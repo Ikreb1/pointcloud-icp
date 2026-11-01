@@ -1,14 +1,20 @@
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
 #include <limits>
 #include <numbers>
+#include <optional>
 #include <random>
 #include <vector>
 
 #include <Eigen/Dense>
 
 constexpr int TEST_SIZE = 10000;
+
+// Max points per k-d tree leaf. Tweak and benchmark: smaller = deeper tree and
+// more node visits, larger = longer brute-force scans in each leaf.
+constexpr int KD_LEAF_SIZE = 16;
 
 struct Point
 {
@@ -94,6 +100,142 @@ NearestResult nearestNeighbour(const Cloud& target, const Point& query)
 	return best;
 }
 
+inline float coord(const Point& p, int axis)
+{
+	return axis == 0 ? p.x : (axis == 1 ? p.y : p.z);
+}
+
+// k-d tree for nearest-neighbour queries. Built once per target cloud (the
+// target never moves during ICP), then queried for every source point.
+//
+// Layout: nodes live in one flat vector and refer to children by index. The
+// points are copied and reordered so each leaf's points are contiguous in
+// memory; `originalIndex` maps them back to indices in the input cloud.
+class KdTree
+{
+public:
+	explicit KdTree(const Cloud& cloud, int leafSize = KD_LEAF_SIZE)
+		: m_leafSize(leafSize)
+	{
+		std::vector<int> order(cloud.points.size());
+		for (int i = 0; i < static_cast<int>(order.size()); ++i)
+			order[i] = i;
+
+		m_nodes.reserve(2 * order.size() / leafSize + 1);
+		build(cloud, order, 0, static_cast<int>(order.size()));
+
+		m_points.reserve(order.size());
+		for (int i : order)
+			m_points.push_back(cloud.points[i]);
+		m_originalIndex = std::move(order);
+	}
+
+	NearestResult nearest(const Point& query) const
+	{
+		NearestResult best;
+		search(0, query, best);
+		return best;
+	}
+
+	int nodeCount() const { return static_cast<int>(m_nodes.size()); }
+
+private:
+	struct Node
+	{
+		int axis;    // 0/1/2 = split axis, -1 = leaf
+		float split; // interior: points with coord <= split go left, >= split go right
+		int a, b;    // interior: left/right child node. leaf: [a, b) range in m_points
+	};
+
+	// Builds the subtree for order[begin, end) and returns its node index.
+	int build(const Cloud& cloud, std::vector<int>& order, int begin, int end)
+	{
+		const int nodeIndex = static_cast<int>(m_nodes.size());
+		m_nodes.push_back({});
+
+		if (end - begin <= m_leafSize)
+		{
+			m_nodes[nodeIndex] = {-1, 0.0f, begin, end};
+			return nodeIndex;
+		}
+
+		// Split on the axis where this subset is widest.
+		Eigen::Vector3f lo = Eigen::Vector3f::Constant(std::numeric_limits<float>::max());
+		Eigen::Vector3f hi = -lo;
+		for (int i = begin; i < end; ++i)
+		{
+			const Point& p = cloud.points[order[i]];
+			const Eigen::Vector3f v(p.x, p.y, p.z);
+			lo = lo.cwiseMin(v);
+			hi = hi.cwiseMax(v);
+		}
+		int axis;
+		(hi - lo).maxCoeff(&axis);
+
+		// Median split: nth_element puts the median at `mid`, smaller-or-equal
+		// before it, larger-or-equal after it. O(n), no full sort needed.
+		const int mid = begin + (end - begin) / 2;
+		std::nth_element(order.begin() + begin, order.begin() + mid, order.begin() + end,
+			[&](int l, int r) { return coord(cloud.points[l], axis) < coord(cloud.points[r], axis); });
+		const float split = coord(cloud.points[order[mid]], axis);
+
+		// Children are built after this node was pushed, so m_nodes may have
+		// reallocated: write through the index, never hold a reference across build().
+		const int left = build(cloud, order, begin, mid);
+		const int right = build(cloud, order, mid, end);
+		m_nodes[nodeIndex] = {axis, split, left, right};
+		return nodeIndex;
+	}
+
+	void search(int nodeIndex, const Point& query, NearestResult& best) const
+	{
+		const Node& node = m_nodes[nodeIndex];
+
+		if (node.axis < 0)
+		{
+			// Leaf: brute force over its contiguous points.
+			for (int i = node.a; i < node.b; ++i)
+			{
+				const Point& p = m_points[i];
+				const float dx = p.x - query.x;
+				const float dy = p.y - query.y;
+				const float dz = p.z - query.z;
+				const float d2 = dx * dx + dy * dy + dz * dz;
+				if (d2 < best.distanceSquared)
+				{
+					best.distanceSquared = d2;
+					best.index = m_originalIndex[i];
+				}
+			}
+			return;
+		}
+
+		// Descend into the side the query is on first: it most likely holds
+		// the nearest point, which shrinks `best` and lets us prune more.
+		const float diff = coord(query, node.axis) - node.split;
+		const int nearChild = diff < 0 ? node.a : node.b;
+		const int farChild = diff < 0 ? node.b : node.a;
+
+		search(nearChild, query, best);
+
+		// Backtrack: everything on the far side is at least |diff| away along
+		// this axis. Only search it if that could beat the best so far.
+		if (diff * diff < best.distanceSquared)
+			search(farChild, query, best);
+	}
+
+	int m_leafSize;
+	std::vector<Node> m_nodes;
+	std::vector<Point> m_points;
+	std::vector<int> m_originalIndex;
+};
+
+enum class Search
+{
+	BruteForce,
+	KdTree,
+};
+
 struct RigidTransform
 {
 	Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
@@ -157,14 +299,23 @@ struct IcpResult
 	int iterations = 0;
 	float rmse = 0;          // root mean square distance between matched pairs
 	double msPerIteration = 0;
+	double buildMs = 0;      // k-d tree build, once per run
 };
 
 // Point-to-point ICP: repeatedly match each source point to its nearest target
 // point, solve for the best rigid transform, and apply it. Stops when the error
 // improves by less than `tolerance` or after `maxIterations`.
-IcpResult runIcp(const Cloud& source, const Cloud& target, int maxIterations, float tolerance, bool verbose)
+IcpResult runIcp(const Cloud& source, const Cloud& target, Search search, int maxIterations, float tolerance, bool verbose)
 {
 	IcpResult result;
+
+	// The target never moves, so the tree is built once and reused every iteration.
+	const auto buildStart = std::chrono::steady_clock::now();
+	std::optional<KdTree> tree;
+	if (search == Search::KdTree)
+		tree.emplace(target);
+	result.buildMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count();
+
 	double totalMs = 0;
 	Cloud current = source;
 	std::vector<int> matches(source.points.size());
@@ -174,11 +325,12 @@ IcpResult runIcp(const Cloud& source, const Cloud& target, int maxIterations, fl
 	{
 		const auto start = std::chrono::steady_clock::now();
 
-		// Match: nearest target point for every source point (the O(N*M) part).
+		// Match: nearest target point for every source point.
+		// Brute force is O(N*M), the tree roughly O(N log M).
 		double sumSquared = 0;
 		for (int i = 0; i < static_cast<int>(current.points.size()); ++i)
 		{
-			const NearestResult nearest = nearestNeighbour(target, current.points[i]);
+			const NearestResult nearest = tree ? tree->nearest(current.points[i]) : nearestNeighbour(target, current.points[i]);
 			matches[i] = nearest.index;
 			sumSquared += nearest.distanceSquared;
 		}
@@ -235,7 +387,7 @@ double rotationErrorDegrees(const Eigen::Matrix3f& estimated, const Eigen::Matri
 	return std::atan2(sinAngle, cosAngle) * 180.0 / std::numbers::pi;
 }
 
-void runScenario(const char* name, const Cloud& source, float angleDegrees, float noiseSigma, std::mt19937& rng)
+void runScenario(const char* name, const Cloud& source, Search search, float angleDegrees, float noiseSigma, std::mt19937& rng)
 {
 	const float angle = angleDegrees * std::numbers::pi_v<float> / 180.0f;
 	const Eigen::Matrix3f R = rotationZ(angle);
@@ -245,7 +397,7 @@ void runScenario(const char* name, const Cloud& source, float angleDegrees, floa
 	if (noiseSigma > 0)
 		target = addNoise(target, noiseSigma, rng);
 
-	const IcpResult icp = runIcp(source, target, 100, 1e-6f, false);
+	const IcpResult icp = runIcp(source, target, search, 100, 1e-6f, false);
 	const double rotErr = rotationErrorDegrees(icp.transform.R, R);
 	const float transErr = (icp.transform.t - t).norm();
 
@@ -254,8 +406,30 @@ void runScenario(const char* name, const Cloud& source, float angleDegrees, floa
 	          << "  rmse " << icp.rmse
 	          << "  rot err " << rotErr << " deg"
 	          << "  trans err " << transErr
-	          << "  " << icp.msPerIteration << " ms/iter"
-	          << (rotErr < 0.5 ? "  OK" : "  FAILED") << "\n";
+	          << "  " << icp.msPerIteration << " ms/iter";
+	if (search == Search::KdTree)
+		std::cout << " (+" << icp.buildMs << " ms build)";
+	std::cout << (rotErr < 0.5 ? "  OK" : "  FAILED") << "\n";
+}
+
+// The tree must give exactly the same distances as brute force. Indices can
+// differ only on exact ties, so compare distances.
+bool kdTreeMatchesBruteForce(const Cloud& cloud, int queries, std::mt19937& rng)
+{
+	const KdTree tree(cloud);
+	std::uniform_real_distribution<float> dist(-1.2f, 1.2f); // some queries outside the cloud
+	for (int q = 0; q < queries; ++q)
+	{
+		const Point query{dist(rng), dist(rng), dist(rng)};
+		const NearestResult expected = nearestNeighbour(cloud, query);
+		const NearestResult actual = tree.nearest(query);
+		if (actual.distanceSquared != expected.distanceSquared)
+		{
+			std::cout << "MISMATCH at query " << q << ": tree " << actual.distanceSquared << " vs brute " << expected.distanceSquared << "\n";
+			return false;
+		}
+	}
+	return true;
 }
 
 int main()
@@ -263,10 +437,20 @@ int main()
 	std::mt19937 rng(42);
 	const Cloud a = makeRandomCloud(TEST_SIZE, rng);
 
-	std::cout << TEST_SIZE << " points, brute-force nearest neighbour\n\n";
-	runScenario("10 deg, clean    ", a, 10, 0.0f, rng);
-	runScenario("10 deg, noise    ", a, 10, 0.005f, rng);
-	runScenario("30 deg, clean    ", a, 30, 0.0f, rng);
-	runScenario("45 deg, clean    ", a, 45, 0.0f, rng);
-	runScenario("90 deg, clean    ", a, 90, 0.0f, rng);
+	std::cout << "k-d tree vs brute force, 10000 random queries: "
+	          << (kdTreeMatchesBruteForce(a, 10000, rng) ? "identical" : "DIFFERENT") << "\n\n";
+
+	std::cout << TEST_SIZE << " points, leaf size " << KD_LEAF_SIZE << "\n";
+	runScenario("brute  10 deg, clean", a, Search::BruteForce, 10, 0.0f, rng);
+	runScenario("kdtree 10 deg, clean", a, Search::KdTree, 10, 0.0f, rng);
+	runScenario("kdtree 10 deg, noise", a, Search::KdTree, 10, 0.005f, rng);
+	runScenario("kdtree 30 deg, clean", a, Search::KdTree, 30, 0.0f, rng);
+	runScenario("kdtree 45 deg, clean", a, Search::KdTree, 45, 0.0f, rng);
+	runScenario("kdtree 90 deg, clean", a, Search::KdTree, 90, 0.0f, rng);
+
+	// Brute force at this size would be ~7 s per iteration.
+	const Cloud big = makeRandomCloud(100000, rng);
+	std::cout << "\n100000 points\n";
+	runScenario("kdtree 10 deg, clean", big, Search::KdTree, 10, 0.0f, rng);
+	runScenario("kdtree 10 deg, noise", big, Search::KdTree, 10, 0.005f, rng);
 }
