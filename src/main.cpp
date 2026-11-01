@@ -303,7 +303,17 @@ struct IcpResult
 	float rmse = 0;          // root mean square distance between matched pairs
 	double msPerIteration = 0;
 	double buildMs = 0;      // k-d tree build, once per run
+
+	// Per-iteration averages of each phase, in ms.
+	double matchMs = 0;      // nearest neighbour for every point (parallel)
+	double alignMs = 0;      // centroids, H, SVD (serial)
+	double transformMs = 0;  // apply R, t to the moving cloud (serial)
 };
+
+double msSince(std::chrono::steady_clock::time_point start)
+{
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
 
 // Point-to-point ICP: repeatedly match each source point to its nearest target
 // point, solve for the best rigid transform, and apply it. Stops when the error
@@ -317,9 +327,9 @@ IcpResult runIcp(const Cloud& source, const Cloud& target, Search search, int ma
 	std::optional<KdTree> tree;
 	if (search == Search::KdTree)
 		tree.emplace(target);
-	result.buildMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count();
+	result.buildMs = msSince(buildStart);
 
-	double totalMs = 0;
+	double totalMs = 0, matchMs = 0, alignMs = 0, transformMs = 0;
 	Cloud current = source;
 	std::vector<int> matches(source.points.size());
 	float previousRmse = std::numeric_limits<float>::max();
@@ -327,6 +337,7 @@ IcpResult runIcp(const Cloud& source, const Cloud& target, Search search, int ma
 	for (int iter = 0; iter < maxIterations; ++iter)
 	{
 		const auto start = std::chrono::steady_clock::now();
+		auto phase = start;
 
 		// Match: nearest target point for every source point.
 		// Brute force is O(N*M), the tree roughly O(N log M).
@@ -342,17 +353,23 @@ IcpResult runIcp(const Cloud& source, const Cloud& target, Search search, int ma
 			sumSquared += nearest.distanceSquared;
 		}
 		const float rmse = static_cast<float>(std::sqrt(sumSquared / current.points.size()));
+		matchMs += msSince(phase);
 
-		// Align and apply.
+		// Align.
+		phase = std::chrono::steady_clock::now();
 		const RigidTransform step = estimateRigidTransform(current, target, matches);
+		alignMs += msSince(phase);
+
+		// Apply.
+		phase = std::chrono::steady_clock::now();
 		current = transformCloud(current, step.R, step.t);
+		transformMs += msSince(phase);
 
 		// Compose: total = step after total, i.e. p -> R_s (R p + t) + t_s.
 		result.transform.R = step.R * result.transform.R;
 		result.transform.t = step.R * result.transform.t + step.t;
 
-		const auto end = std::chrono::steady_clock::now();
-		const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+		const double ms = msSince(start);
 		totalMs += ms;
 		if (verbose)
 			std::cout << "iter " << iter << "  rmse " << rmse << "  " << ms << " ms\n";
@@ -364,6 +381,9 @@ IcpResult runIcp(const Cloud& source, const Cloud& target, Search search, int ma
 		previousRmse = rmse;
 	}
 	result.msPerIteration = totalMs / result.iterations;
+	result.matchMs = matchMs / result.iterations;
+	result.alignMs = alignMs / result.iterations;
+	result.transformMs = transformMs / result.iterations;
 	return result;
 }
 
@@ -417,6 +437,11 @@ void runScenario(const char* name, const Cloud& source, Search search, float ang
 	if (search == Search::KdTree)
 		std::cout << " (+" << icp.buildMs << " ms build)";
 	std::cout << (rotErr < 0.5 ? "  OK" : "  FAILED") << "\n";
+
+	const double pct = 100.0 / icp.msPerIteration;
+	std::cout << "    per iter: match " << icp.matchMs << " ms (" << icp.matchMs * pct << "%)"
+	          << "  align " << icp.alignMs << " ms (" << icp.alignMs * pct << "%)"
+	          << "  transform " << icp.transformMs << " ms (" << icp.transformMs * pct << "%)\n";
 }
 
 // The tree must give exactly the same distances as brute force. Indices can
